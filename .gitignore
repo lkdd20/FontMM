@@ -7,6 +7,35 @@ reasonix.toml
 .agent/
 
 .ref/
+# 构建产物: 模块内二进制 (由 dev/build-*.mjs 交叉编译)
 src/tools/fontmm-wght
+src/tools/fontmm-subset
 golang/bin/
 src/SHA256SUMS
+
+# 派生字体配置: 由设备端 customize.sh 扫描系统 XML 生成, 不随仓库分发。
+# dev/sync-fonts-xml.mjs 会在本地生成这些文件供调试, 需避免误提交。
+src/system/etc/fonts_base.xml
+src/system/etc/fonts_ule.xml
+src/system/etc/font_fallback.xml
+src/system/system_ext/
+
+# Zygisk 模块产物 (由 dev/build-zygisk.mjs 生成)
+src/zygisk/
+native/build/
+
+# 编辑器 C++ 索引数据 (由 dev/build-zygisk.mjs 生成)
+compile_commands.json
+
+# 预压缩构建缓存 (dev/pack.mjs 自动生成, 体积大且与机器相关的 mtime 绑定)
+dev/.cache/
+
+# Pyodide 运行时: 由 web/scripts/sync-pyodide.mjs 在构建时从 npm 的 pyodide
+# 包复制 (与依赖同源, 避免仓库里留一份易过期的副本)。
+# 例外: 两个 wheel 不在 npm 包内, 仍需随仓库提供, 故不在此忽略。
+web/public/pyodide/pyodide.asm.mjs
+web/public/pyodide/pyodide.asm.wasm
+web/public/pyodide/pyodide.js
+web/public/pyodide/pyodide.mjs
+web/public/pyodide/pyodide-lock.json
+web/public/pyodide/python_stdlib.zip

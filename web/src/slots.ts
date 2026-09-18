@@ -1,7 +1,7 @@
-import { FontFilePicker } from './fontPicker';
+import { fontPicker } from './fontPicker';
 import { exec, shellQuote } from './ksu';
 import { readFontInfo } from './fontInfo';
-import { ensureFontsCopy } from './fontFiles';
+import { ensureFontsCopy, getEnSubsetSizeText } from './fontFiles';
 import { FONTS_DIR, TEST_FONT_DIR } from './constants';
 import { applyBtn } from './dom';
 import type { FontSlot } from './types';
@@ -55,13 +55,16 @@ export function setApplying(v: boolean): void {
   applying = v;
 }
 
-const picker = new FontFilePicker((path, name) => {
-  const slot = slots[pickingKey];
-  slot.path = path;
-  slot.fileName = name;
-  renderSlots();
-  void refreshSlotInfo(slot);
-});
+function pickFontFor(key: SlotKey): void {
+  pickingKey = key;
+  fontPicker.show('/storage/emulated/0', (path, name) => {
+    const slot = slots[pickingKey];
+    slot.path = path;
+    slot.fileName = name;
+    renderSlots();
+    void refreshSlotInfo(slot);
+  });
+}
 
 // 未选择时的占位文案: 回退可视化 (WYSIWYG)
 function slotPlaceholder(slot: FontSlot): string {
@@ -97,6 +100,14 @@ export function renderSlots() {
       const nameText = required ? '未选择字体，此项为必选项' : slotPlaceholder(slot);
       // 扩展名大写 (TTF/OTF...), 从源文件路径动态提取, 不硬编码
       const ext = slot.path ? (slot.path.split('.').pop() ?? '').toUpperCase() : '';
+      // 英文字体被裁成拉丁子集后, 卡片上同时给出「原大小 → 子集大小」与徽标,
+      // 否则用户看到原字体大小, 会以为裁切没生效 (issue #14)
+      const sizeText = slot.subsetSizeText
+        ? `${slot.sizeText || '…'} → ${slot.subsetSizeText}`
+        : slot.sizeText || '…';
+      const subsetBadge = slot.subsetSizeText
+        ? `<span class="slot-meta-badge slot-meta-badge--subset" title="英文字体自带中文字形, 安装时已裁切为纯拉丁子集; 装入系统的是这个子集">已子集化</span>`
+        : '';
       return `
     <md-filled-card class="slot-card ${slot.key === 'hans' ? 'slot-hans' : ''} ${slot.path ? 'selected' : ''}" data-key="${slot.key}">
       <div class="slot-header">
@@ -118,7 +129,7 @@ export function renderSlots() {
           <div class="slot-name ${!slot.path ? 'placeholder' : ''} ${required ? 'required' : ''}">${nameText}</div>
           ${
             slot.path
-              ? `<div class="slot-meta"><span class="slot-meta-badge">${slot.sizeText || '…'}</span>${ext ? `<span class="slot-meta-badge">${ext}</span>` : ''}${slot.isVariable ? `<span class="slot-meta-badge slot-meta-badge--variable">可变字体${slot.wghtRange ? ` ${slot.wghtRange}` : ''}</span>` : ''}</div>`
+              ? `<div class="slot-meta"><span class="slot-meta-badge">${sizeText}</span>${ext ? `<span class="slot-meta-badge">${ext}</span>` : ''}${subsetBadge}${slot.isVariable ? `<span class="slot-meta-badge slot-meta-badge--variable">可变字体${slot.wghtRange ? ` ${slot.wghtRange}` : ''}</span>` : ''}</div>`
               : ''
           }
         </div>
@@ -128,11 +139,10 @@ export function renderSlots() {
     })
     .join('');
 
-  // 绑定事件: 整卡点击选择字体
+  // 绑定事件: 整卡点击选择字体 (回调按点击的槽位处理)
   slotsEl.querySelectorAll<HTMLElement>('.slot-card').forEach((card) => {
     card.addEventListener('click', () => {
-      pickingKey = card.dataset.key as SlotKey;
-      picker.show();
+      pickFontFor(card.dataset.key as SlotKey);
     });
   });
   slotsEl.querySelectorAll<HTMLElement>('.slot-clear').forEach((btn) => {
@@ -141,6 +151,12 @@ export function renderSlots() {
       const slot = slots[btn.dataset.key as SlotKey];
       slot.path = null;
       slot.fileName = '';
+      // 解析结果一并清掉: 否则字重映射的轴范围 (取各槽位最小跨度) 与可变字体标记
+      // 会停留在被删掉的字体上 —— 删掉 200-900 的字体后仍只能选 200-900
+      slot.sizeText = undefined;
+      slot.isVariable = false;
+      slot.wghtRange = undefined;
+      slot.subsetSizeText = undefined;
       renderSlots();
     });
   });
@@ -183,6 +199,8 @@ export function pickWghtRange(): { min: number; max: number } | null {
 // 选择新字体后: 复制到 fonts-test 供解析, 更新卡片显示的名称/大小
 async function refreshSlotInfo(slot: FontSlot) {
   if (!slot.path) return;
+  // 换了英文字体: 旧的子集标记描述的是「上次应用」的状态, 先撤下, 应用后再刷新
+  if (slot.key === 'en') slot.subsetSizeText = undefined;
   try {
     await exec(`cp -f ${shellQuote(slot.path)} ${shellQuote(`${TEST_FONT_DIR}/${slot.key}.ttf`)}`);
     const info = await readFontInfo(`${slot.key}.ttf`);
@@ -195,6 +213,11 @@ async function refreshSlotInfo(slot: FontSlot) {
   } catch {
     // 忽略解析失败, 保持选择器返回的文件名
   }
+}
+
+// 刷新英文槽位的子集信息 (打开 WebUI 时, 以及每次应用后)。不负责重绘。
+export async function refreshEnSubset(): Promise<void> {
+  slots.en.subsetSizeText = (await getEnSubsetSizeText()) ?? undefined;
 }
 
 // 打开 WebUI 时: 复制 FONT/ 到 fonts-test, 读取已有字体的名称/大小填充卡片
@@ -211,6 +234,7 @@ async function loadExistingFonts() {
     slot.isVariable = Boolean(info.isVariable);
     slot.wghtRange = info.wghtRange;
   }
+  await refreshEnSubset();
   renderSlots();
 }
 

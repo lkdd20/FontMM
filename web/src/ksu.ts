@@ -100,19 +100,36 @@ async function mockExec(command: string): Promise<ExecResult> {
     return slow('name=KernelSU MetaModule\nversion=v1.0\nauthor=KernelSU');
   }
 
-  // 小米主题字体工具: 搜索/详情/下载 (模拟)
+  // 小米主题字体工具: 搜索 (模拟)
+  // 结构与真实接口一致: apiData.cards[].items[].schema.clicks[] 携带 title/link/pic,
+  // apiData.hasMore 标识是否还有下一页
   if (command.includes('thm.market.intl.xiaomi.com')) {
+    // 第二页返回空, 用于验证「下一页」按钮状态
+    if (/[?&]page=1\b/.test(command)) {
+      return slow(JSON.stringify({ apiData: { hasMore: false, cards: [] } }));
+    }
     return slow(
       JSON.stringify({
         apiData: {
+          hasMore: true,
           cards: [
             {
               items: [
                 {
+                  type: 'endlessList',
                   schema: {
+                    type: 'Font',
                     clicks: [
-                      { title: 'MiSans Global (模拟)', link: 'mock-font-1' },
-                      { title: 'OPPO Sans (模拟)', link: 'mock-font-2' },
+                      {
+                        title: 'MiSans Global (模拟)',
+                        link: 'mock-font-1',
+                        pic: 'ThemeMarket/mock-pic-1',
+                      },
+                      {
+                        title: 'OPPO Sans (模拟)',
+                        link: 'mock-font-2',
+                        pic: 'ThemeMarket/mock-pic-2',
+                      },
                     ],
                   },
                 },
@@ -157,6 +174,11 @@ async function mockExec(command: string): Promise<ExecResult> {
         '__DONE__',
       ].join('\n'),
     );
+  }
+
+  // 字体预热器状态检测 (模拟: 库已安装 + 检测到 Zygisk Next, 模块 ID 用真实的 zygisksu)
+  if (command.includes('LIB:yes') && command.includes('PROV:')) {
+    return slow('LIB:yes\nMAGISK:na\nPROV:zygisksu');
   }
 
   if (command.includes('ro.product.model')) return slow('Pixel 8 Pro (模拟设备)');
@@ -276,6 +298,85 @@ export async function getSystemInfo(): Promise<SystemInfo> {
     // 读取失败时保持空值, 由 UI 显示占位
   }
   return info;
+}
+
+// ---------------- 主页: 字体预热器状态 ----------------
+
+export interface PreloaderStatus {
+  /** 预加载库是否随模块安装 (zygisk/arm64-v8a.so 存在) */
+  libInstalled: boolean;
+  /** 是否检测到可用的 Zygisk 环境 */
+  zygiskReady: boolean;
+  /** 检测到的 Zygisk 提供者名称 (如 "Magisk 内置" / "Zygisk Next"), 未检测到为空 */
+  provider: string;
+}
+
+// 模块内 Zygisk 库路径 (与 dev/lib/ndk.mjs 的产物名一致)
+const ZYGISK_LIB = '/data/adb/modules/FontMM/zygisk/arm64-v8a.so';
+
+/**
+ * 检测字体预热器状态。
+ *
+ * Zygisk 提供者的识别规则与 src/customize.sh 的 CHECK_ZYGISK_ENV 保持一致 ——
+ * 两处判断标准不同会让用户看到互相矛盾的结论 (刷入时说可用、首页说不可用)。
+ */
+export async function getPreloaderStatus(): Promise<PreloaderStatus> {
+  if (import.meta.env.DEV) {
+    return { libInstalled: true, zygiskReady: true, provider: 'Zygisk Next (模拟)' };
+  }
+
+  const status: PreloaderStatus = { libInstalled: false, zygiskReady: false, provider: '' };
+  try {
+    // 一条命令拿全部信息, 减少 root shell 往返。每项都用显式前缀标记,
+    // 避免靠输出内容猜测 (例如 Magisk 开关值恰好也是 "1")。
+    const cmd = [
+      // 1. 预加载库是否随模块安装
+      `if [ -f '${ZYGISK_LIB}' ]; then echo 'LIB:yes'; else echo 'LIB:no'; fi`,
+      // 2. Magisk 内置 Zygisk 开关 (值为 1 表示启用)
+      `if [ -f /data/adb/magisk/magisk ]; then v=$(/data/adb/magisk/magisk --sqlite "SELECT value FROM settings WHERE key='zygisk';" 2>/dev/null | tr -d '\\r'); if [ "$v" = "1" ]; then echo 'MAGISK:yes'; else echo 'MAGISK:no'; fi; else echo 'MAGISK:na'; fi`,
+      // 3. 独立 Zygisk 提供者模块
+      //    判据是提供者**独有**的文件: lib{64}/libzygisk.so (核心库) 或
+      //    bin/zygiskd{64,32} (守护进程)。注意不能以 zygisk/ 目录判断 ——
+      //    那是「Zygisk 模块」(消费者) 的标志, 任何自带 zygisk/<abi>.so 的
+      //    模块都有 (本模块自己也有), 据此判断会把消费者误认成提供者。
+      //    这些文件名取自 Zygisk Next 与 ReZygisk 的实际安装布局。
+      `for d in /data/adb/modules/*; do [ -d "$d" ] || continue; n=$(basename "$d"); [ "$n" = "FontMM" ] && continue; [ -f "$d/disable" ] && continue; for f in "$d/lib64/libzygisk.so" "$d/lib/libzygisk.so" "$d/bin/zygiskd64" "$d/bin/zygiskd32" "$d/bin/zygiskd" "$d/lib64/libzn_loader.so" "$d/lib/libzn_loader.so"; do if [ -f "$f" ]; then echo "PROV:$n"; break; fi; done; done`,
+    ].join('; ');
+
+    const { errno, stdout } = await exec(cmd);
+    if (errno !== 0) return status;
+
+    const lines = stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    status.libInstalled = lines.includes('LIB:yes');
+
+    if (lines.includes('MAGISK:yes')) {
+      status.zygiskReady = true;
+      status.provider = 'Magisk 内置 Zygisk';
+    }
+
+    // 独立提供者模块 (Zygisk Next / ReZygisk 等)
+    const prov = lines.find((l) => l.startsWith('PROV:'));
+    if (prov) {
+      const name = prov.slice('PROV:'.length);
+      // 模块目录名可读性较差 (如 rezygisk), 做一次友好化映射
+      const friendly: Record<string, string> = {
+        rezygisk: 'ReZygisk',
+        // Zygisk Next 的模块 ID 是 zygisksu (取自其 module.prop)
+        zygisksu: 'Zygisk Next',
+        zygisknext: 'Zygisk Next',
+        'zygisk-next': 'Zygisk Next',
+      };
+      status.zygiskReady = true;
+      status.provider = friendly[name.toLowerCase()] ?? name;
+    }
+  } catch {
+    // 读取失败保持默认值 (未安装 / 不可用)
+  }
+  return status;
 }
 
 // 用 am start 在 WebUI 之外打开链接/应用 (避免在 WebView 内打开)

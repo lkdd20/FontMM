@@ -1,6 +1,6 @@
 import '@material/web/button/filled-button.js';
 import { exec, shellQuote } from './ksu';
-import { FontFilePicker } from './fontPicker';
+import { fontPicker } from './fontPicker';
 import { renderPreview, type PreviewData } from './previewRenderer';
 
 // ---------------- 工具框架 ----------------
@@ -104,6 +104,36 @@ const SEARCH_API = 'https://thm.market.intl.xiaomi.com/thm/search/npage?category
 // 格式: thumbnail/{format}/{尺寸参数}/{pic}, 如 thumbnail/webp/w120q70/ThemeMarket/xxx
 const PIC_BASE = 'https://t17.market.mi-img.com/thumbnail/webp/w120q70/';
 
+/** 搜索结果条目 (来自 apiData.cards[].items[].schema.clicks[]) */
+interface MiFontItem {
+  title: string;
+  /** 主题 ID, 详情 API 用它换取下载地址 */
+  link: string;
+  /** 相对图片路径 */
+  pic: string;
+}
+
+/**
+ * 解析搜索响应。
+ * 真实结构: apiData.cards[].items[].schema.clicks[] —— 字段 title/link/pic;
+ * 找不到结果时返回 noResultMessage 类型的 item (clicks 为空)。
+ */
+function parseSearchResponse(data: any): MiFontItem[] {
+  const cards: any[] = data?.apiData?.cards ?? [];
+  const items: MiFontItem[] = [];
+  for (const card of cards) {
+    for (const item of card?.items ?? []) {
+      for (const click of item?.schema?.clicks ?? []) {
+        const title = String(click?.title ?? '').trim();
+        const link = String(click?.link ?? '').trim();
+        if (!title || !link) continue;
+        items.push({ title, link, pic: String(click?.pic ?? '') });
+      }
+    }
+  }
+  return items;
+}
+
 export const MiFontToolDef: ToolDef = {
   id: 'mi-font',
   title: '下载国际版小米主题字体',
@@ -141,36 +171,42 @@ export const MiFontToolDef: ToolDef = {
     const escapeHtml = (s: string): string =>
       s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-    const renderItems = (items: any[]): void => {
+    const renderItems = (items: MiFontItem[]): void => {
       resultEl.textContent = '';
       for (const it of items) {
         const card = document.createElement('div');
         card.className = 'mi-item';
         const pic = it.pic ? `${PIC_BASE}${it.pic}` : '';
-        const time = it.time ? new Date(it.time).toLocaleDateString() : '';
         card.innerHTML = `
           <div class="mi-item-info">
             <div class="mi-item-title"></div>
-            <div class="mi-item-sub">${escapeHtml(it.certified ? '官方认证 · ' : '')}${time}</div>
           </div>
           ${pic ? `<img class="mi-item-pic" src="${escapeHtml(pic)}" alt="" loading="lazy" onerror="this.remove()">` : ''}
           <md-icon-button class="mi-item-dl" aria-label="下载">
             <md-icon>download</md-icon>
           </md-icon-button>
         `;
-        card.querySelector('.mi-item-title')!.textContent = it.title ?? '';
+        card.querySelector('.mi-item-title')!.textContent = it.title;
+        // 下载所需的主题 ID 存在按钮上, 供点击时读取 (之前未写入导致下载始终失败)
+        const dlBtn = card.querySelector('.mi-item-dl') as HTMLElement;
+        dlBtn.dataset.link = it.link;
+        dlBtn.dataset.title = it.title;
         resultEl.appendChild(card);
       }
     };
 
-    const renderPager = (total: number): void => {
-      const pages = Math.max(1, Math.ceil(total / 20));
+    // 分页: 接口每页固定返回 12 条并以 hasMore 标识是否还有下一页。
+    // 之前按「返回条数 >= 20 才算有下一页」估算总数, 与真实分页规则不符,
+    // 会导致第一页就显示 100 页。改为记录 hasMore, 只区分「有/无下一页」。
+    let hasMore = false;
+
+    const renderPager = (): void => {
       const nav = document.createElement('div');
       nav.className = 'mi-pager';
       nav.innerHTML = `
         <md-text-button id="mi-prev" ${pageNo === 0 ? 'disabled' : ''}>上一页</md-text-button>
-        <span class="mi-page">第 ${pageNo + 1} / ${pages} 页</span>
-        <md-text-button id="mi-next" ${pageNo + 1 >= pages ? 'disabled' : ''}>下一页</md-text-button>
+        <span class="mi-page">第 ${pageNo + 1} 页</span>
+        <md-text-button id="mi-next" ${hasMore ? '' : 'disabled'}>下一页</md-text-button>
       `;
       resultEl.appendChild(nav);
       nav.querySelector('#mi-prev')?.addEventListener('click', () => {
@@ -180,7 +216,7 @@ export const MiFontToolDef: ToolDef = {
         }
       });
       nav.querySelector('#mi-next')?.addEventListener('click', () => {
-        if (pageNo + 1 < pages) {
+        if (hasMore) {
           pageNo++;
           void search(pageNo);
         }
@@ -198,13 +234,14 @@ export const MiFontToolDef: ToolDef = {
         const { errno, stdout } = await exec(`curl -s ${shellQuote(url)}`);
         if (errno !== 0) throw new Error('curl 执行失败');
         const data = JSON.parse(stdout);
-        const items = data?.data?.items ?? [];
+        const items = parseSearchResponse(data);
         if (items.length === 0) {
           resultEl.textContent = '未找到相关字体, 换个关键词试试';
           return;
         }
+        hasMore = Boolean(data?.apiData?.hasMore);
         renderItems(items);
-        renderPager(items.length >= 20 ? 100 : items.length);
+        renderPager();
       } catch (e) {
         resultEl.textContent = `搜索失败: ${(e as Error).message}`;
       } finally {
@@ -231,9 +268,14 @@ export const MiFontToolDef: ToolDef = {
 
     const startDownload = async (itemEl: HTMLElement): Promise<void> => {
       if (downloading) return;
-      const card = itemEl.closest('.mi-item') as HTMLElement;
-      const title = card.querySelector('.mi-item-title')?.textContent ?? '';
-      const link = (card.querySelector('.mi-item-dl') as HTMLElement | null)?.dataset.link ?? '';
+      // link/title 由 renderItems 写在按钮的 data-* 上
+      const title = itemEl.dataset.title ?? '';
+      const link = itemEl.dataset.link ?? '';
+      if (!link) {
+        logEl.hidden = false;
+        logEl.textContent = '下载失败: 缺少主题 ID, 请重新搜索后再试';
+        return;
+      }
       downloading = true;
       try {
         const logFile = '/data/adb/modules/FontMM/webroot/mi-download.log';
@@ -335,7 +377,6 @@ class FontEditorPage {
   private originalBytes: Uint8Array | null = null;
   private fileName = '';
   private hasNameChanges = false;
-  private picker: FontFilePicker | null = null;
   private previewText = DEFAULT_PREVIEW_TEXT;
 
   private editTimer: number | null = null;
@@ -460,10 +501,9 @@ class FontEditorPage {
       void this.loadFont('demo-font.ttf', 'demo-font.ttf');
       return;
     }
-    this.picker ??= new FontFilePicker((path, name) => {
+    fontPicker.show('/storage/emulated/0/Download', (path, name) => {
       void this.copyAndLoad(path, name);
     });
-    this.picker.show('/storage/emulated/0/Download');
   }
 
   private async copyAndLoad(path: string, name: string): Promise<void> {
